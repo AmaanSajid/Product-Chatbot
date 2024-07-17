@@ -23,8 +23,91 @@ from google.cloud import aiplatform
 import fitz  
 import random
 import string
+import psycopg2
+from psycopg2.extras import RealDictCursor
+###################################################
+def create_db_connection():
+    return psycopg2.connect(
+        host="localhost",
+        dbname="postgres",
+        user="postgres",
+        password="",
+        port=5432)
 
+def create_tables():
+    conn = create_db_connection()
+    with conn.cursor() as cur:
+        # Check if tables exist
+        cur.execute("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+        """)
+        existing_tables = [row[0] for row in cur.fetchall()]
 
+        # Create teams table if it doesn't exist
+        if 'teams' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE teams (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
+                    code VARCHAR(6) UNIQUE NOT NULL
+                )
+            """)
+
+        # Create team_members table if it doesn't exist
+        if 'team_members' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE team_members (
+                    id SERIAL PRIMARY KEY,
+                    team_id INTEGER REFERENCES teams(id),
+                    name VARCHAR(255) NOT NULL
+                )
+            """)
+
+        # Create chat_history table if it doesn't exist
+        if 'chat_history' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE chat_history (
+                    id SERIAL PRIMARY KEY,
+                    team_id INTEGER REFERENCES teams(id),
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL
+                )
+            """)
+
+        # Create pdfs table if it doesn't exist
+        if 'pdfs' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE pdfs (
+                    id SERIAL PRIMARY KEY,
+                    team_id INTEGER REFERENCES teams(id),
+                    file_path VARCHAR(255) NOT NULL
+                )
+            """)
+
+    conn.commit()
+    conn.close()
+    
+def create_team(team_name):
+    team_code = generate_team_code()
+    conn = create_db_connection()
+    with conn.cursor() as cur:
+        cur.execute("INSERT INTO teams (name, code) VALUES (%s, %s) RETURNING id", (team_name, team_code))
+        team_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return team_code
+
+def join_team(team_code):
+    conn = create_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM teams WHERE code = %s", (team_code,))
+        team = cur.fetchone()
+    conn.close()
+    return team is not None
+
+########################################################################################
 def extract_sentences_from_pdf(pdf_path):
     document = fitz.open(pdf_path)
     sentences = []
@@ -209,6 +292,7 @@ def init_session_state():
     
 
 def main():
+    create_tables()
     st.set_page_config("Project Workflow and Chat", layout="wide")
     load_css("style.css")
     init_session_state()
@@ -274,9 +358,19 @@ def display_chat_page():
             process_pdfs(pdf_docs)
 
         if 'current_team' in st.session_state:
-            team = st.session_state.teams[st.session_state.current_team]
-            if team['pdfs']:
-                selected_pdf = st.selectbox("Select a PDF to preview", team['pdfs'])
+            conn = create_db_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT file_path FROM pdfs WHERE team_id = %s", (st.session_state.current_team,))
+                team_pdfs = [row['file_path'] for row in cur.fetchall()]
+            conn.close()
+
+            if team_pdfs:
+                selected_pdf = st.selectbox("Select a PDF to preview", team_pdfs)
+                if selected_pdf:
+                    display_pdf(selected_pdf)
+        else:
+            if st.session_state.uploaded_pdfs:
+                selected_pdf = st.selectbox("Select a PDF to preview", st.session_state.uploaded_pdfs)
                 if selected_pdf:
                     display_pdf(selected_pdf)
 
@@ -291,14 +385,30 @@ def display_chat_page():
         if st.button("Submit Question"):
             handle_user_question(user_question)
 
-        if 'chat_history' in st.session_state:
-            for i, (q, a) in enumerate(st.session_state.chat_history):
-                st.write(f"Q: {q}")
-                st.write(f"A: {a}")
-                if st.button("Pin", key=f"pin_{i}"):
-                    st.session_state.pinned_messages.append((q, a))
-                st.write("---")
+        if 'current_team' in st.session_state:
+            conn = create_db_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT question, answer FROM chat_history WHERE team_id = %s ORDER BY id", 
+                            (st.session_state.current_team,))
+                chat_history = cur.fetchall()
+            conn.close()
 
+            for i, chat in enumerate(chat_history):
+                st.write(f"Q: {chat['question']}")
+                st.write(f"A: {chat['answer']}")
+                if st.button("Pin", key=f"pin_{i}"):
+                    st.session_state.pinned_messages.append((chat['question'], chat['answer']))
+                st.write("---")
+        else:
+            if 'chat_history' in st.session_state:
+                for i, (q, a) in enumerate(st.session_state.chat_history):
+                    st.write(f"Q: {q}")
+                    st.write(f"A: {a}")
+                    if st.button("Pin", key=f"pin_{i}"):
+                        st.session_state.pinned_messages.append((q, a))
+                    st.write("---")
+
+    with col2:
         display_pinned_messages()
 
 def display_pinned_messages():
@@ -323,8 +433,12 @@ def handle_user_question(user_question):
             answer = model.generate_content(user_question).text
 
         if 'current_team' in st.session_state:
-            team = st.session_state.teams[st.session_state.current_team]
-            team['chat_history'].append((user_question, answer))
+            conn = create_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO chat_history (team_id, question, answer) VALUES (%s, %s, %s)",
+                            (st.session_state.current_team, user_question, answer))
+            conn.commit()
+            conn.close()
         else:
             if 'chat_history' not in st.session_state:
                 st.session_state.chat_history = []
@@ -340,17 +454,23 @@ def process_pdfs(pdf_docs):
             os.makedirs(pdf_path)
         
         if 'current_team' in st.session_state:
-            team = st.session_state.teams[st.session_state.current_team]
-            team['pdfs'] = []
-        
-        for uploaded_file in pdf_docs:
-            file_path = os.path.join(pdf_path, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            if 'current_team' in st.session_state:
-                team['pdfs'].append(file_path)
-            else:
+            conn = create_db_connection()
+            with conn.cursor() as cur:
+                for uploaded_file in pdf_docs:
+                    file_path = os.path.join(pdf_path, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    cur.execute("INSERT INTO pdfs (team_id, file_path) VALUES (%s, %s)",
+                                (st.session_state.current_team, file_path))
+            conn.commit()
+            conn.close()
+        else:
+            for uploaded_file in pdf_docs:
+                file_path = os.path.join(pdf_path, uploaded_file.name)
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
                 st.session_state.uploaded_pdfs.append(file_path)
+        
         try:
             generate_and_save_embeddings(pdf_path, sentence_file_path, embed_file_path)
             create_and_save_faiss_index(embed_file_path, index_file_path)
@@ -364,7 +484,7 @@ def process_pdfs(pdf_docs):
                 st.sidebar.error("Index files not found. Processing failed.")
         except Exception as e:
             st.sidebar.error(f"An error occurred during processing: {str(e)}")
-
+            
 def display_pdf(pdf_path):
     with open(pdf_path, "rb") as f:
         base64_pdf = base64.b64encode(f.read()).decode('utf-8')
