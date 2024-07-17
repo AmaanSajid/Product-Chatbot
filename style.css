@@ -1,0 +1,25 @@
+body {
+    background-color: white;
+}
+.stButton>button {
+    background-color: red;
+    color: white;
+}
+.stTextInput>div>div>input {
+    background-color: lightblue;
+}
+.stTextArea>div>textarea {
+    background-color: lightblue;
+}
+.css-18e3th9 {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+.css-1kyxreq {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
