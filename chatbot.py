@@ -31,7 +31,7 @@ def create_db_connection():
         host="localhost",
         dbname="postgres",
         user="postgres",
-        password="",
+        password="Amaansajid@1808",
         port=5432)
 
 def create_tables():
@@ -97,15 +97,18 @@ def create_team(team_name):
         team_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
-    return team_code
+    return team_id, team_code
 
 def join_team(team_code):
     conn = create_db_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT * FROM teams WHERE code = %s", (team_code,))
+        cur.execute("SELECT id FROM teams WHERE code = %s", (team_code,))
         team = cur.fetchone()
     conn.close()
-    return team is not None
+    if team:
+        st.session_state.current_team_id = team['id']
+        return True
+    return False
 
 ########################################################################################
 def extract_sentences_from_pdf(pdf_path):
@@ -240,22 +243,40 @@ def generate_team_code():
 
 def create_team(team_name):
     team_code = generate_team_code()
-    # Store team information (you might want to use a database for this)
-    if 'teams' not in st.session_state:
-        st.session_state.teams = {}
-    st.session_state.teams[team_code] = {
-        'name': team_name,
-        'members': [],
-        'chat_history': [],
-        'pdfs': []
-    }
-    return team_code
+    conn = create_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO teams (name, code) VALUES (%s, %s) RETURNING id", (team_name, team_code))
+            team_id = cur.fetchone()[0]
+        conn.commit()
+        st.success(f"Team created successfully. ID: {team_id}, Code: {team_code}")
+        return team_id, team_code
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error creating team: {str(e)}")
+        return None, None
+    finally:
+        conn.close()
 
 def join_team(team_code):
-    if team_code in st.session_state.teams:
-        # Add logic to add the current user to the team
-        return True
-    return False
+    conn = create_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM teams WHERE code = %s", (team_code,))
+            team = cur.fetchone()
+        
+        if team:
+            st.session_state.current_team_id = team['id']
+            st.session_state.current_team_name = team['name']
+            return True
+        else:
+            st.error(f"No team found with code: {team_code}")
+            return False
+    except Exception as e:
+        st.error(f"Error joining team: {str(e)}")
+        return False
+    finally:
+        conn.close()
 
 
 
@@ -289,41 +310,11 @@ def init_session_state():
         st.session_state.uploaded_pdfs = []
     if 'pinned_messages' not in st.session_state:
         st.session_state.pinned_messages = []
+    if 'teams' not in st.session_state:
+        st.session_state.teams = {}
     
-
-def main():
-    create_tables()
-    st.set_page_config("Project Workflow and Chat", layout="wide")
-    load_css("style.css")
-    init_session_state()
-
-    st.sidebar.title("Team Options")
-    team_option = st.sidebar.radio("Choose an option", ["Create Team", "Join Team", "Solo Mode"])
-
-    if team_option == "Create Team":
-        team_name = st.sidebar.text_input("Enter team name:")
-        if st.sidebar.button("Create Team"):
-            team_code = create_team(team_name)
-            st.sidebar.success(f"Team created! Your team code is: {team_code}")
-            st.session_state.current_team = team_code
-
-    elif team_option == "Join Team":
-        team_code = st.sidebar.text_input("Enter team code:")
-        if st.sidebar.button("Join Team"):
-            if join_team(team_code):
-                st.sidebar.success("Joined team successfully!")
-                st.session_state.current_team = team_code
-            else:
-                st.sidebar.error("Invalid team code")
-
-    if 'current_team' in st.session_state:
-        st.sidebar.write(f"Current Team: {st.session_state.teams[st.session_state.current_team]['name']}")
-
-    if not st.session_state.show_chat:
-        display_workflow_page()
-    else:
-        display_chat_page()
-
+                    
+                    
 def display_workflow_page():
     st.header("Generate Project Workflow")
 
@@ -333,7 +324,7 @@ def display_workflow_page():
         project_name = st.text_input("Enter your project name:")
         project_description = st.text_area("Enter a brief description of your project:", height=150)
         
-        if st.button("Generate Workflow"):
+        if st.button("Generate Workflow",key="generate_workflow_button"):
             if project_name and project_description:
                 vertexai.init(project=project, location=location)
                 model = GenerativeModel("gemini-pro")
@@ -350,10 +341,11 @@ def display_workflow_page():
 
 def display_chat_page():
     st.title("Chat with PDF")
+    
 
     with st.sidebar:
         st.header("PDF Upload")
-        pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True)
+        pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader_chat_page")
         if st.button("Process PDFs"):
             process_pdfs(pdf_docs)
 
@@ -382,7 +374,7 @@ def display_chat_page():
 
         st.subheader("How can I help you?")
         user_question = st.text_input("Enter your question:")
-        if st.button("Submit Question"):
+        if st.button("Submit Question",key="submit_question_button"):
             handle_user_question(user_question)
 
         if 'current_team' in st.session_state:
@@ -490,6 +482,75 @@ def display_pdf(pdf_path):
         base64_pdf = base64.b64encode(f.read()).decode('utf-8')
     pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
     st.markdown(pdf_display, unsafe_allow_html=True)
+    
+    
+def main():
+    create_tables()
+    st.set_page_config("Project Workflow and Chat", layout="wide")
+    load_css("style.css")
+    init_session_state()
+
+    if not st.session_state.show_chat:
+        # Workflow page
+        st.sidebar.title("Team Options")
+        team_option = st.sidebar.radio("Choose an option", ["Create Team", "Join Team", "Solo Mode"])
+
+        if team_option == "Create Team":
+            team_name = st.sidebar.text_input("Enter team name:")
+            if st.sidebar.button("Create Team", key="create_team_button"):
+                if team_name:
+                    team_id, team_code = create_team(team_name)
+                    if team_id is not None and team_code is not None:
+                        st.sidebar.success(f"Team created! Your team code is: {team_code}")
+                        st.session_state.current_team_id = team_id
+                        st.session_state.current_team_code = team_code
+                else:
+                    st.sidebar.error("Please enter a team name.")
+
+        elif team_option == "Join Team":
+            team_code = st.sidebar.text_input("Enter team code:")
+            if st.sidebar.button("Join Team", key="join_team_button"):
+                if join_team(team_code):
+                    st.sidebar.success(f"Joined team successfully! Team: {st.session_state.current_team_name}")
+                else:
+                    st.sidebar.error("Failed to join team. Please check the code and try again.")
+
+        if 'current_team_id' in st.session_state:
+            conn = create_db_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT name FROM teams WHERE id = %s", (st.session_state.current_team_id,))
+                team = cur.fetchone()
+            conn.close()
+            if team:
+                st.sidebar.write(f"Current Team: {team['name']}")
+
+        display_workflow_page()
+
+    else:
+        # Chat page
+        st.sidebar.title("PDF Options")
+        pdf_docs = st.sidebar.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader_sidebar")
+        if st.sidebar.button("Process PDFs", key="process_pdfs_button"):
+            process_pdfs(pdf_docs)
+
+        if 'current_team_id' in st.session_state:
+            conn = create_db_connection()
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT file_path FROM pdfs WHERE team_id = %s", (st.session_state.current_team_id,))
+                team_pdfs = [row['file_path'] for row in cur.fetchall()]
+            conn.close()
+
+            if team_pdfs:
+                selected_pdf = st.sidebar.selectbox("Select a PDF to preview", team_pdfs, key="pdf_select_sidebar")
+                if selected_pdf:
+                    display_pdf(selected_pdf)
+        else:
+            if st.session_state.uploaded_pdfs:
+                selected_pdf = st.sidebar.selectbox("Select a PDF to preview", st.session_state.uploaded_pdfs, key="pdf_select_solo_sidebar")
+                if selected_pdf:
+                    display_pdf(selected_pdf)
+
+        display_chat_page()
 
 if __name__ == "__main__":
     main()
