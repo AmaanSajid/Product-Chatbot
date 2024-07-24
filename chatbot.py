@@ -37,15 +37,12 @@ def create_db_connection():
 def create_tables():
     conn = create_db_connection()
     with conn.cursor() as cur:
-        # Check if tables exist
         cur.execute("""
             SELECT table_name 
             FROM information_schema.tables 
             WHERE table_schema = 'public'
         """)
         existing_tables = [row[0] for row in cur.fetchall()]
-
-        # Create teams table if it doesn't exist
         if 'teams' not in existing_tables:
             cur.execute("""
                 CREATE TABLE teams (
@@ -54,8 +51,6 @@ def create_tables():
                     code VARCHAR(6) UNIQUE NOT NULL
                 )
             """)
-
-        # Create team_members table if it doesn't exist
         if 'team_members' not in existing_tables:
             cur.execute("""
                 CREATE TABLE team_members (
@@ -64,8 +59,6 @@ def create_tables():
                     name VARCHAR(255) NOT NULL
                 )
             """)
-
-        # Create chat_history table if it doesn't exist
         if 'chat_history' not in existing_tables:
             cur.execute("""
                 CREATE TABLE chat_history (
@@ -75,8 +68,6 @@ def create_tables():
                     answer TEXT NOT NULL
                 )
             """)
-
-        # Create pdfs table if it doesn't exist
         if 'pdfs' not in existing_tables:
             cur.execute("""
                 CREATE TABLE pdfs (
@@ -85,31 +76,81 @@ def create_tables():
                     file_path VARCHAR(255) NOT NULL
                 )
             """)
-
+        if 'group_members' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE group_members (
+                    id SERIAL PRIMARY KEY,
+                    team_id INTEGER REFERENCES teams(id),
+                    member_name VARCHAR(255) NOT NULL
+                )
+            """)
+        if 'pinned_messages' not in existing_tables:
+            cur.execute("""
+                CREATE TABLE pinned_messages (
+                    id SERIAL PRIMARY KEY,
+                    team_id INTEGER REFERENCES teams(id),
+                    member_name VARCHAR(255) NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL
+                )
+            """)
     conn.commit()
     conn.close()
     
-def create_team(team_name):
+def create_team(team_name, member_name):
     team_code = generate_team_code()
     conn = create_db_connection()
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO teams (name, code) VALUES (%s, %s) RETURNING id", (team_name, team_code))
-        team_id = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return team_id, team_code
-
-def join_team(team_code):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO teams (name, code) VALUES (%s, %s) RETURNING id", (team_name, team_code))
+            team_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO group_members (team_id, member_name) VALUES (%s, %s)", (team_id, member_name))
+        conn.commit()
+        st.success(f"Team created successfully. ID: {team_id}, Code: {team_code}")
+        return team_id, team_code
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Error creating team: {str(e)}")
+        return None, None
+    finally:
+        conn.close()
+        
+def join_team(team_code, member_name):
     conn = create_db_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT id FROM teams WHERE code = %s", (team_code,))
-        team = cur.fetchone()
-    conn.close()
-    if team:
-        st.session_state.current_team_id = team['id']
-        return True
-    return False
-
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name FROM teams WHERE code = %s", (team_code,))
+            team = cur.fetchone()
+        
+        if team:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO group_members (team_id, member_name) VALUES (%s, %s)", (team['id'], member_name))
+            
+            # Load pinned messages
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT member_name, question, answer
+                    FROM pinned_messages
+                    WHERE team_id = %s
+                    ORDER BY id DESC
+                """, (team['id'],))
+                pinned_messages = cur.fetchall()
+            
+            conn.commit()
+            st.session_state.current_team_id = team['id']
+            st.session_state.current_team_name = team['name']
+            st.session_state.current_member_name = member_name
+            st.session_state.pinned_messages = pinned_messages
+            return True
+        else:
+            st.error(f"No team found with code: {team_code}")
+            return False
+    except Exception as e:
+        st.error(f"Error joining team: {str(e)}")
+        return False
+    finally:
+        conn.close()
+        
 ########################################################################################
 def extract_sentences_from_pdf(pdf_path):
     document = fitz.open(pdf_path)
@@ -241,13 +282,14 @@ def generate_workflow(project_name, project_description, model):
 def generate_team_code():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
-def create_team(team_name):
+def create_team(team_name, member_name):
     team_code = generate_team_code()
     conn = create_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("INSERT INTO teams (name, code) VALUES (%s, %s) RETURNING id", (team_name, team_code))
             team_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO group_members (team_id, member_name) VALUES (%s, %s)", (team_id, member_name))
         conn.commit()
         st.success(f"Team created successfully. ID: {team_id}, Code: {team_code}")
         return team_id, team_code
@@ -257,30 +299,6 @@ def create_team(team_name):
         return None, None
     finally:
         conn.close()
-
-def join_team(team_code):
-    conn = create_db_connection()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT id, name FROM teams WHERE code = %s", (team_code,))
-            team = cur.fetchone()
-        
-        if team:
-            st.session_state.current_team_id = team['id']
-            st.session_state.current_team_name = team['name']
-            return True
-        else:
-            st.error(f"No team found with code: {team_code}")
-            return False
-    except Exception as e:
-        st.error(f"Error joining team: {str(e)}")
-        return False
-    finally:
-        conn.close()
-
-
-
-
 ############################
 
 def load_css(file_name):
@@ -312,6 +330,10 @@ def init_session_state():
         st.session_state.pinned_messages = []
     if 'teams' not in st.session_state:
         st.session_state.teams = {}
+    if 'current_instructions' not in st.session_state:
+        st.session_state.current_instructions = []
+    if 'solo_pinned_messages' not in st.session_state:
+        st.session_state.solo_pinned_messages = []
     
                     
                     
@@ -341,30 +363,6 @@ def display_workflow_page():
 
 def display_chat_page():
     st.title("Chat with PDF")
-    
-
-    with st.sidebar:
-        st.header("PDF Upload")
-        pdf_docs = st.file_uploader("Upload your PDF Files", accept_multiple_files=True, key="pdf_uploader_chat_page")
-        if st.button("Process PDFs"):
-            process_pdfs(pdf_docs)
-
-        if 'current_team' in st.session_state:
-            conn = create_db_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT file_path FROM pdfs WHERE team_id = %s", (st.session_state.current_team,))
-                team_pdfs = [row['file_path'] for row in cur.fetchall()]
-            conn.close()
-
-            if team_pdfs:
-                selected_pdf = st.selectbox("Select a PDF to preview", team_pdfs)
-                if selected_pdf:
-                    display_pdf(selected_pdf)
-        else:
-            if st.session_state.uploaded_pdfs:
-                selected_pdf = st.selectbox("Select a PDF to preview", st.session_state.uploaded_pdfs)
-                if selected_pdf:
-                    display_pdf(selected_pdf)
 
     col1, col2 = st.columns([3, 1])
 
@@ -374,72 +372,171 @@ def display_chat_page():
 
         st.subheader("How can I help you?")
         user_question = st.text_input("Enter your question:")
-        if st.button("Submit Question",key="submit_question_button"):
-            handle_user_question(user_question)
+        
+        col_submit, col_instruct = st.columns([1, 1])
+        
+        with col_submit:
+            submit_button = st.button("Submit Question", key="submit_question_button")
+        
+        with col_instruct:
+            instruct_button = st.button("Instruct", key="instruct_button")
+        
+        # Instruct functionality
+        if 'show_instructions' not in st.session_state:
+            st.session_state.show_instructions = False
+        
+        if instruct_button:
+            st.session_state.show_instructions = not st.session_state.show_instructions
+        
+        if st.session_state.show_instructions:
+            instructions = st.multiselect(
+                "Select instructions:",
+                ["Give only Code without explanation", "Give only explanation", "Keep it less than 100 words", "Summarize"],
+                default=st.session_state.get('current_instructions', []),
+                key="instruction_multiselect"
+            )
+            st.session_state.current_instructions = instructions
+        
+        # Display preview of chosen instructions
+        if st.session_state.get('current_instructions'):
+            st.write("Current instructions:")
+            for instruction in st.session_state.current_instructions:
+                st.write(f"- {instruction}")
+        
+        if submit_button and user_question:
+            answer = handle_user_question(user_question)
+            if answer:
+                st.write("Reply:", answer)
+                if st.button("Pin Message", key=f"pin_{len(st.session_state.get('chat_history', []))}"):
+                    pin_message(
+                        st.session_state.get('current_team_id'),
+                        st.session_state.get('current_member_name', 'Solo User'),
+                        user_question,
+                        answer
+                    )
+                    st.experimental_rerun()
 
-        if 'current_team' in st.session_state:
-            conn = create_db_connection()
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT question, answer FROM chat_history WHERE team_id = %s ORDER BY id", 
-                            (st.session_state.current_team,))
-                chat_history = cur.fetchall()
-            conn.close()
-
-            for i, chat in enumerate(chat_history):
-                st.write(f"Q: {chat['question']}")
-                st.write(f"A: {chat['answer']}")
-                if st.button("Pin", key=f"pin_{i}"):
-                    st.session_state.pinned_messages.append((chat['question'], chat['answer']))
-                st.write("---")
-        else:
-            if 'chat_history' in st.session_state:
-                for i, (q, a) in enumerate(st.session_state.chat_history):
+        # Display chat history
+        st.subheader("Chat History")
+        if 'chat_history' in st.session_state:
+            for i, (q, a) in enumerate(reversed(st.session_state.chat_history)):
+                with st.expander(f"Q: {q[:50]}..."):
                     st.write(f"Q: {q}")
                     st.write(f"A: {a}")
-                    if st.button("Pin", key=f"pin_{i}"):
-                        st.session_state.pinned_messages.append((q, a))
-                    st.write("---")
+                    if st.button(f"Pin Message {i}", key=f"pin_history_{i}"):
+                        pin_message(
+                            st.session_state.get('current_team_id'),
+                            st.session_state.get('current_member_name', 'Solo User'),
+                            q,
+                            a
+                        )
+                        st.experimental_rerun()
 
     with col2:
-        display_pinned_messages()
-
-def display_pinned_messages():
-    st.subheader("Pinned Messages")
-    for i, (q, a) in enumerate(st.session_state.pinned_messages):
-        if st.checkbox(f"Show pinned message {i+1}", key=f"expand_{i}"):
-            st.write(f"Q: {q}")
-            st.write(f"A: {a}")
-
+        if 'current_team_id' in st.session_state:
+            display_pinned_messages(st.session_state.current_team_id)
+        else:
+            display_pinned_messages(None)
+                        
 def handle_user_question(user_question):
     if user_question:
         vertexai.init(project=project, location=location)
         model = GenerativeModel("gemini-pro")
 
-        if 'pdfs_processed' in st.session_state and st.session_state.pdfs_processed:
-            index_path = "faiss_index"
-            ids_path = "faiss_index.ids"
-            content_file_path = "resume_sentences.json"
-            index, ids = load_local_faiss_index(index_path, ids_path)
-            answer = answer_prompt(user_question, index, ids, content_file_path, model)
-        else:
-            answer = model.generate_content(user_question).text
+        # Prepare the prompt with instructions
+        prompt = user_question
+        if st.session_state.get('current_instructions'):
+            instruction_prompt = " ".join(st.session_state.current_instructions)
+            prompt = f"{instruction_prompt} for the following question: {user_question}"
 
-        if 'current_team' in st.session_state:
-            conn = create_db_connection()
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO chat_history (team_id, question, answer) VALUES (%s, %s, %s)",
-                            (st.session_state.current_team, user_question, answer))
-            conn.commit()
-            conn.close()
-        else:
+        try:
+            if 'pdfs_processed' in st.session_state and st.session_state.pdfs_processed:
+                index_path = "faiss_index"
+                ids_path = "faiss_index.ids"
+                content_file_path = "resume_sentences.json"
+                index, ids = load_local_faiss_index(index_path, ids_path)
+                answer = answer_prompt(prompt, index, ids, content_file_path, model)
+            else:
+                answer = model.generate_content(prompt).text
+
+            if 'current_team_id' in st.session_state:
+                conn = create_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO chat_history (team_id, question, answer) VALUES (%s, %s, %s)",
+                                (st.session_state.current_team_id, user_question, answer))
+                conn.commit()
+                conn.close()
+            
+            # Always store in session state chat history
             if 'chat_history' not in st.session_state:
                 st.session_state.chat_history = []
             st.session_state.chat_history.append((user_question, answer))
 
-        st.write("Reply:", answer)
+            return answer
+        except Exception as e:
+            st.error(f"An error occurred while processing your question: {str(e)}")
+            return None
     else:
         st.warning("Please enter a question.")
+        return None
+        
+def pin_message(team_id, member_name, question, answer):
+    if team_id is not None:
+        conn = create_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO pinned_messages (team_id, member_name, question, answer)
+                    VALUES (%s, %s, %s, %s)
+                """, (team_id, member_name, question, answer))
+            conn.commit()
+            st.success("Message pinned!")
+            # Refresh pinned messages in session state
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT member_name, question, answer
+                    FROM pinned_messages
+                    WHERE team_id = %s
+                    ORDER BY id DESC
+                """, (team_id,))
+                st.session_state.pinned_messages = cur.fetchall()
+        except Exception as e:
+            st.error(f"Error pinning message: {str(e)}")
+        finally:
+            conn.close()
+    else:
+        # Handle solo user
+        if 'solo_pinned_messages' not in st.session_state:
+            st.session_state.solo_pinned_messages = []
+        st.session_state.solo_pinned_messages.append({
+            'member_name': 'Solo User',
+            'question': question,
+            'answer': answer
+        })
+        st.success("Message pinned!")
 
+def display_pinned_messages(team_id):
+    st.subheader("Pinned Messages")
+    
+    if team_id is not None:
+        pinned_messages = st.session_state.get('pinned_messages', [])
+    else:
+        pinned_messages = st.session_state.get('solo_pinned_messages', [])
+    
+    for i, msg in enumerate(pinned_messages):
+        with st.expander(f"Pinned by {msg['member_name']} - {msg['question'][:30]}..."):
+            st.write(f"Q: {msg['question']}")
+            st.write(f"A: {msg['answer']}")
+    else:
+        # Display solo user pinned messages
+        for i, msg in enumerate(st.session_state.get('solo_pinned_messages', [])):
+            with st.expander(f"Pinned Message {i+1} - {msg['question'][:30]}..."):
+                st.write(f"Q: {msg['question']}")
+                st.write(f"A: {msg['answer']}")
+
+    if not team_id and not st.session_state.get('solo_pinned_messages'):
+        st.write("No pinned messages yet.")
+                
 def process_pdfs(pdf_docs):
     with st.spinner("Processing..."):
         if not os.path.exists(pdf_path):
@@ -494,26 +591,32 @@ def main():
         # Workflow page
         st.sidebar.title("Team Options")
         team_option = st.sidebar.radio("Choose an option", ["Create Team", "Join Team", "Solo Mode"])
-
         if team_option == "Create Team":
             team_name = st.sidebar.text_input("Enter team name:")
+            member_name = st.sidebar.text_input("Enter your name:")
             if st.sidebar.button("Create Team", key="create_team_button"):
-                if team_name:
-                    team_id, team_code = create_team(team_name)
+                if team_name and member_name:
+                    team_id, team_code = create_team(team_name, member_name)
                     if team_id is not None and team_code is not None:
                         st.sidebar.success(f"Team created! Your team code is: {team_code}")
                         st.session_state.current_team_id = team_id
-                        st.session_state.current_team_code = team_code
+                        st.session_state.current_team_name = team_name
+                        st.session_state.current_member_name = member_name
                 else:
-                    st.sidebar.error("Please enter a team name.")
+                    st.sidebar.error("Please enter both team name and your name.")
 
         elif team_option == "Join Team":
             team_code = st.sidebar.text_input("Enter team code:")
+            member_name = st.sidebar.text_input("Enter your name:")
             if st.sidebar.button("Join Team", key="join_team_button"):
-                if join_team(team_code):
-                    st.sidebar.success(f"Joined team successfully! Team: {st.session_state.current_team_name}")
+                if team_code and member_name:
+                    if join_team(team_code, member_name):
+                        st.sidebar.success(f"Joined team successfully! Team: {st.session_state.current_team_name}")
+                        st.experimental_rerun()  # Force a rerun to update the display
+                    else:
+                        st.sidebar.error("Failed to join team. Please check the code and try again.")
                 else:
-                    st.sidebar.error("Failed to join team. Please check the code and try again.")
+                    st.sidebar.error("Please enter both team code and your name.")
 
         if 'current_team_id' in st.session_state:
             conn = create_db_connection()
@@ -523,6 +626,7 @@ def main():
             conn.close()
             if team:
                 st.sidebar.write(f"Current Team: {team['name']}")
+                st.sidebar.write(f"Your Name: {st.session_state.current_member_name}")
 
         display_workflow_page()
 
@@ -554,3 +658,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
