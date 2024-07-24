@@ -31,7 +31,7 @@ def create_db_connection():
         host="localhost",
         dbname="postgres",
         user="postgres",
-        password="Amaansajid@1808",
+        password="",
         port=5432)
 
 def create_tables():
